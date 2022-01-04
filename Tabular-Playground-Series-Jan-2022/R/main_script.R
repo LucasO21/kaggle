@@ -10,6 +10,14 @@ library(janitor)
 library(lubridate)
 library(timetk)
 
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+library(modeltime.resample)
+library(kernlab)
+library(rules)
+library(earth)
+
 # * 1.2 Load Data ----
 train_raw_tbl <- read.csv("../Data/train.csv") %>% as_tibble() %>% clean_names()
 
@@ -146,6 +154,131 @@ future_tbl <- full_data_tbl %>%
 future_tbl %>% sapply(function(x) sum(is.na(x)))
 
 # * 3.4 Time Split ----
-data_prepared_tbl %>% 
+split_obj <- data_prepared_tbl %>% 
     time_series_split(date, assess = 56, cumulative = TRUE)
+
+split_obj %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, num_sold)
+
+#  4.0 RECIPES/DATA PREPROCESSING ----
+
+# * 4.1 Clean Data - Remove Outliers ----
+train_cleaned <- training(split_obj) %>% 
+    group_by(country, store, product) %>% 
+    mutate(num_sold = ts_clean_vec(num_sold, period = 7))
+
+
+training(split_obj) %>% 
+    group_by(country, store, product) %>% 
+    plot_time_series(
+        .date_var   = date,
+        .value      = num_sold,
+        .facet_ncol = 4,
+    )
+
+train_cleaned %>% 
+    group_by(country, store, product) %>% 
+    plot_time_series(
+        .date_var   = date,
+        .value      = num_sold,
+        .facet_ncol = 4,
+    )
+
+# * 4.2 Recipe Specification ----
+recipe_spec <- recipe(num_sold ~ ., data = train_cleaned) %>% 
+    update_role(rowid, new_role = "indicator") %>% 
+    step_timeseries_signature(date) %>% 
+    step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>% 
+    step_normalize(date_index.num, date_year) %>% 
+    step_other(country, store, product) %>% 
+    step_dummy(all_nominal(), one_hot = TRUE)
+
+recipe_spec %>% prep() %>% juice() %>% glimpse()
+
+# 5.0 MODELING ----
+
+# * 5.1 Prophet ----
+wflw_fit_prophet <- workflow() %>% 
+    add_model(
+        spec = prophet_reg() %>% set_engine("prophet")
+    ) %>% 
+    add_recipe(recipe_spec) %>% 
+    fit(train_cleaned)
+
+# * 5.2 Xgboost ----
+wflw_fit_xgboost <- workflow() %>% 
+    add_model(
+        spec = boost_tree() %>% set_mode("regression") %>% set_engine("xgboost")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * 5.3 Prophet Boost ----
+wflw_fit_prophet_boost <-  workflow() %>% 
+    add_model(
+        spec = prophet_boost(
+            seasonality_daily  = FALSE,
+            seasonality_weekly = FALSE,
+            seasonality_yearly = FALSE
+        ) %>% set_engine("prophet_xgboost")
+    ) %>% 
+    add_recipe(recipe_spec) %>% 
+    fit(train_cleaned)
+
+# * 5.4 SVM RBF ----
+wflw_fit_svm <- workflow() %>% 
+    add_model(
+        spec = svm_rbf() %>% set_mode("regression") %>% set_engine("kernlab")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * Random Forest ----
+wflw_fit_rf <- workflow() %>% 
+    add_model(
+        spec = rand_forest() %>% set_mode("regression") %>% set_engine("ranger")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * Neural Net ----
+wflw_fit_nnet <- workflow() %>% 
+    add_model(
+        spec = mlp() %>% set_mode("regression") %>% set_engine("nnet")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * MARS ----
+wflw_fit_mars <- workflow() %>% 
+    add_model(
+        spec = mars() %>% set_mode("regression") %>% set_engine("earth")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * Cubist ----
+wflw_fit_cubist <- workflow() %>% 
+    add_model(
+        spec = cubist_rules() %>% set_mode("regression") %>% set_engine("Cubist")
+    ) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
+    fit(train_cleaned)
+
+# * 5.5 Accuracy Check ----
+sub_models_fit_tbl <- modeltime_table(
+    wflw_fit_prophet,
+    wflw_fit_xgboost,
+    wflw_fit_prophet_boost,
+    wflw_fit_svm,
+    wflw_fit_rf,
+    wflw_fit_nnet,
+    wflw_fit_mars,
+    wflw_fit_cubist
+)
+
+sub_models_fit_tbl %>% 
+    modeltime_accuracy(testing(split_obj)) %>% 
+    arrange(smape)
 
