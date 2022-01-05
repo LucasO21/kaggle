@@ -3,6 +3,7 @@
 # SOURCE - "https://www.kaggle.com/c/tabular-playground-series-jan-2022/overview"
 
 # 1.0 SETUP ----
+setwd("C:/Users/lokwudishu/Desktop/Projects/Kaggle/Tabular-Playground-Series-Jan-2022/R")
 
 # * 1.1 Libraries ----
 library(tidyverse)
@@ -17,6 +18,11 @@ library(modeltime.resample)
 library(kernlab)
 library(rules)
 library(earth)
+
+library(tictoc)
+library(future)
+library(doFuture)
+library(parallel)
 
 # * 1.2 Load Data ----
 train_raw_tbl <- read.csv("../Data/train.csv") %>% as_tibble() %>% clean_names()
@@ -109,6 +115,7 @@ train_clean_tbl %>%
 # * 3.1 * Aggregate Data ----
 full_data_tbl <- train_clean_tbl %>% 
     group_by(country, store, product) %>% 
+    filter(date >= as.Date("2016-01-01")) %>% 
     summarise_by_time(.date_var = date, .by = "day", num_sold = sum(num_sold)) %>% 
     ungroup() %>% 
     
@@ -140,16 +147,20 @@ full_data_tbl <- train_clean_tbl %>%
     bind_rows() %>% 
     rowid_to_column(var = "rowid")
 
-full_data_tbl
+full_data_tbl %>% glimpse()
 
 # * 3.2 Data Prepared ----
 data_prepared_tbl <- full_data_tbl %>% 
     filter(!is.na(num_sold)) %>% 
     drop_na()
 
+data_prepared_tbl %>% glimpse()
+
 # * 3.3 Future Data ----
 future_tbl <- full_data_tbl %>% 
     filter(is.na(num_sold))
+
+future_tbl %>% glimpse()
 
 future_tbl %>% sapply(function(x) sum(is.na(x)))
 
@@ -282,3 +293,126 @@ sub_models_fit_tbl %>%
     modeltime_accuracy(testing(split_obj)) %>% 
     arrange(smape)
 
+# 6.0 HYPERPARAMETER TUNINT ----
+
+# * 6.1 Setting Up Parallel Processing ----
+registerDoFuture()
+n_cores <- 4
+plan(strategy = cluster, workers = makeCluster(n_cores))
+
+plan(strategy = sequential)
+
+# * 6.2 Resamples Spec ----
+set.seed(123)
+resamples_kfold <- train_cleaned %>% vfold_cv(v = 5)
+
+resamples_kfold %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(.date_var = date, .value = num_sold, .facet_ncol = 2)
+
+
+# * Model Tuning ----
+
+# ** Cubist Tune ----
+model_spec_cubist_tune <- cubist_rules(
+    mode = "regression",
+    committees = tune(),
+    neighbors  = tune()
+) %>% 
+    set_engine("Cubist")
+
+wflw_spec_cubist_tune <- workflow() %>% 
+    add_model(model_spec_cubist_tune) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+set.seed(123)
+tic()
+tune_results_cubist <- wflw_spec_cubist_tune %>% 
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 10,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+toc()
+
+wflw_spec_cubist_tune %>% write_rds("../Artifacts/cubist_tuned.rds")
+
+
+# ** Ranger Tune ----
+model_spec_ranger_tune <- rand_forest(
+    mode           = "regression",
+    mtry           = tune(),
+    trees          = tune(),
+    min_n          = tune()
+) %>% 
+    set_engine("ranger")
+
+wflw_spec_ranger_tune <- workflow() %>% 
+    add_model(model_spec_ranger_tune) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+
+set.seed(223)
+tic()
+tune_results_ranger <- wflw_spec_ranger_tune %>%
+    tune_grid(
+        resamples  = resamples_kfold,
+        grid       = 10,
+        control    = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+toc()
+
+tune_results_ranger %>% write_rds("../Artifacts/ranger_tuned.rds")
+
+# ** Xgboost Tune ----
+model_spec_xgboost_tune <- boost_tree(
+    mode           = "regression",
+    mtry           = tune(),
+    trees          = tune(),
+    min_n          = tune(),
+    tree_depth     = tune(),
+    learn_rate     = tune(),
+    loss_reduction = tune()
+) %>% 
+    set_engine("xgboost")
+
+wflw_spec_xgboost_tune <- workflow() %>% 
+    add_model(model_spec_xgboost_tune) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+tic()
+set.seed(123)
+tune_results_xgboost <- wflw_spec_xgboost_tune %>% 
+    tune_grid(
+        resamples  = resamples_kfold,
+        param_info = parameters(wflw_spec_xgboost_tune) %>% 
+            update(learn_rate = learn_rate(c(0.001, 0.400), trans = NULL)),
+        grid       = 10,
+        control    = control_grid(verbose = TRUE, allow_par = TRUE)
+        
+    )
+toc()
+
+# ** SVM RBF ----
+model_spec_svm_rbf_tune <- svm_rbf(
+    mode      = "regression",
+    cost      = tune(),
+    rbf_sigma = tune(),
+    margin    = tune()
+) %>% 
+    set_engine("kernlab")
+
+wflw_spec_svm_rbf_tune <- workflow() %>% 
+    add_model(model_spec_svm_rbf_tune) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+tic()
+set.seed(123)
+tune_results_svm_rbf <- wflw_spec_svm_rbf_tune %>% 
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 10,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+toc()
