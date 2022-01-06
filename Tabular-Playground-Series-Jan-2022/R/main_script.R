@@ -311,7 +311,7 @@ resamples_kfold %>%
     plot_time_series_cv_plan(.date_var = date, .value = num_sold, .facet_ncol = 2)
 
 
-# * Model Tuning ----
+# * 6.3 Model Tuning ----
 
 # ** Cubist Tune ----
 model_spec_cubist_tune <- cubist_rules(
@@ -335,7 +335,11 @@ tune_results_cubist <- wflw_spec_cubist_tune %>%
     )
 toc()
 
-wflw_spec_cubist_tune %>% write_rds("../Artifacts/cubist_tuned.rds")
+wflw_fit_cubist_tuned <- wflw_spec_cubist_tune %>% 
+    finalize_workflow(select_best(tune_results_cubist, "rmse")) %>% 
+    fit(train_cleaned)
+
+wflw_fit_cubist_tuned %>% write_rds("../Artifacts/cubist_tuned.rds")
 
 
 # ** Ranger Tune ----
@@ -363,7 +367,11 @@ tune_results_ranger <- wflw_spec_ranger_tune %>%
     )
 toc()
 
-tune_results_ranger %>% write_rds("../Artifacts/ranger_tuned.rds")
+wflw_fit_ranger_tuned <- wflw_spec_ranger_tune %>% 
+    finalize_workflow(select_best(tune_results_ranger, "rmse")) %>% 
+    fit(train_cleaned)
+
+wflw_fit_ranger_tuned %>% write_rds("../Artifacts/ranger_tuned.rds")
 
 # ** Xgboost Tune ----
 model_spec_xgboost_tune <- boost_tree(
@@ -394,6 +402,12 @@ tune_results_xgboost <- wflw_spec_xgboost_tune %>%
     )
 toc()
 
+wflw_fit_xgboost_tuned <- wflw_spec_xgboost_tune %>% 
+    finalize_workflow(select_best(tune_results_xgboost, "rmse")) %>% 
+    fit(train_cleaned)
+
+wflw_fit_xgboost_tuned %>% write_rds("../Artifacts/xgboost_tuned.rds")
+
 # ** SVM RBF ----
 model_spec_svm_rbf_tune <- svm_rbf(
     mode      = "regression",
@@ -416,3 +430,174 @@ tune_results_svm_rbf <- wflw_spec_svm_rbf_tune %>%
         control   = control_grid(verbose = TRUE, allow_par = TRUE)
     )
 toc()
+
+wflw_fit_svm_rbf_tuned <- wflw_spec_svm_rbf_tune %>% 
+    finalize_workflow(select_best(tune_results_svm_rbf, "rmse")) %>% 
+    fit(train_cleaned)
+
+wflw_fit_svm_rbf_tuned %>% write_rds("../Artifacts/svm_rbf_tuned.rds")
+
+# * 6.4 Model Evaluation ----
+
+# ** Modeltime Table ----
+sub_models_fit_2_tbl <- modeltime_table(
+    wflw_fit_cubist_tuned,
+    wflw_fit_ranger_tuned,
+    wflw_fit_xgboost_tuned,
+    wflw_fit_svm_rbf_tuned
+) %>% 
+    update_model_description(1, "CUBIST - Tuned") %>% 
+    update_model_description(2, "RANGER - Tuned") %>% 
+    update_model_description(3, "XGBOOST - Tuned") %>% 
+    update_model_description(4, "KERNLAB - Tuned") %>% 
+    combine_modeltime_tables(sub_models_fit_tbl)
+
+# ** Calibration Table ----
+calibration_tbl <- sub_models_fit_2_tbl %>% 
+    modeltime_calibrate(testing(split_obj))
+
+# ** Accuracy Check ----
+calibration_tbl %>% 
+    modeltime_accuracy() %>% 
+    arrange(smape)
+
+# ** Visualize ----
+forecast_tbl <- calibration_tbl %>% 
+    modeltime_forecast(
+        new_data    = testing(split_obj),
+        actual_data = data_prepared_tbl,
+        keep_data   = TRUE 
+    ) 
+
+forecast_tbl %>% 
+    filter(country == "Sweden") %>% 
+    filter(date >= as.Date("2018-01-01")) %>% 
+    filter(product == "Kaggle Hat") %>% 
+    group_by(store, product) %>% 
+    plot_modeltime_forecast(
+        .facet_ncol         = 4,
+        .conf_interval_show = FALSE
+    )
+
+
+# 7.0 RESAMPLING ----
+
+# - Assess the stability of our models over time
+
+# * 7.1 Time Series CV ----
+set.seed(123)
+resamples_tscv <- train_cleaned %>% 
+    time_series_cv(
+        assess      = 56,
+        skip        = 56,
+        cumulative  = TRUE,
+        slice_limit = 4 
+    )
+
+resamples_tscv %>% 
+    tk_time_series_cv_plan() %>% 
+    plot_time_series_cv_plan(date, num_sold)
+
+# * 7.2 Fitting Resamples ----
+model_tbl_tuned_resamples <- sub_models_fit_2_tbl %>% 
+    filter(.model_desc != "NNET") %>% 
+    modeltime_fit_resamples(
+        resamples = resamples_tscv,
+        control = control_resamples(verbose = TRUE, allow_par = TRUE)
+    )
+
+# * 7.3 Resampling Accuracy Table ----
+model_tbl_tuned_resamples_accuracy <- model_tbl_tuned_resamples %>% 
+    modeltime_resample_accuracy(
+        metric_set = metric_set(rmse, smape),
+        summary_fns = list(mean = mean, sd = sd)
+    ) %>% 
+    arrange(smape_mean)
+
+# * 7.3 Visualize Tuned Resamples ----
+model_tbl_tuned_resamples %>% 
+    plot_modeltime_resamples(
+        .metric_set  = metric_set(smape),
+        .point_size  = 4,
+        .point_alpha = 0.8,
+        .facet_ncol  = 1
+    )
+
+# 8.0 ENSEMBLING ----
+
+# * 8.1 Average Ensemble ----
+sub_models_2_ids_to_keep <- c(3, 2, 1)
+
+ensemble_fit_1 <- sub_models_fit_2_tbl %>% 
+    filter(.model_id %in% sub_models_2_ids_to_keep) %>% 
+    ensemble_average()
+
+ensemble_fit_2 <- sub_models_fit_2_tbl %>% 
+    filter(.model_id %in% sub_models_2_ids_to_keep[1:2]) %>% 
+    ensemble_average()
+
+ensemble_fit_3 <- sub_models_fit_2_tbl %>% 
+    filter(.model_id %in% sub_models_2_ids_to_keep[c(1, 3)]) %>% 
+    ensemble_average()
+
+ensemble_fit_4 <- sub_models_fit_2_tbl %>% 
+    filter(.model_id %in% sub_models_2_ids_to_keep[2:3]) %>% 
+    ensemble_average()
+
+model_ensemble_tbl <- modeltime_table(
+    ensemble_fit_1, 
+    ensemble_fit_2,
+    ensemble_fit_3,
+    ensemble_fit_4
+) %>% 
+    update_model_description(1, 'ENSEMBLE (MEAN) - Xgboost, Ranger, Cubist') %>% 
+    update_model_description(2, "ENSEMBLE (MEAN) - Ranger, Xgboost") %>% 
+    update_model_description(3, "ENSEMBLE (MEAN) - Cubist, Xgboost") %>% 
+    update_model_description(4, "ENSEMBLE (MEAN) - Ranger, Cubist")
+
+# * 8.2 Ensemble Accuracy ----
+model_ensemble_calibrate_tbl <- model_ensemble_tbl %>% 
+    modeltime_calibrate(testing(split_obj))
+
+model_ensemble_calibrate_tbl %>% 
+    modeltime_accuracy() %>% 
+    arrange(smape)
+
+# 9.0 REFIT ----
+
+# Here we refit the best ensemble model on the entire dataset
+
+data_prepared_tbl_cleaned <- data_prepared_tbl %>% 
+    group_by(country, store, product) %>% 
+    mutate(num_sold = ts_clean_vec(num_sold, period = 7)) %>% 
+    ungroup()
+
+model_ensemble_refit_tbl <- model_ensemble_tbl %>% 
+    filter(.model_id == 1) %>% 
+    modeltime_refit(
+        data = data_prepared_tbl_cleaned
+    )
+
+
+model_ensemble_refit_tbl %>% 
+    modeltime_forecast(
+        test_clean_tbl %>% mutate(num_sold = NA)
+    )
+
+
+# SAVING ARTIFACTS ----
+feature_engineering_artifacts_list_2 <- list(
+    
+    # Recipe
+    recipes = list(recipe = recipe_spec),
+    
+    # Models Tuned
+    models = list(
+        sub_models_tuned = sub_models_fit_2_tbl,
+        ensemble_models  = model_ensemble_tbl
+    )
+    
+)
+
+feature_engineering_artifacts_list_2 %>% 
+    write_rds("../Artifacts/feat_engineering_artifacts_list_1.rds")
