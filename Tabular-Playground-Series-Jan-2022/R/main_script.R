@@ -45,7 +45,7 @@ train_raw_tbl %>% count(country)
 train_raw_tbl %>% count(store)
 train_raw_tbl %>% count(product)
 
-# 1.4 Initial Data Cleaning/Formatting ----
+#*  1.4 Initial Data Cleaning/Formatting ----
 train_clean_tbl <- train_raw_tbl %>% 
     mutate(date = ymd(date)) 
 
@@ -124,7 +124,7 @@ full_data_tbl <- train_clean_tbl %>%
     
     # extend into future 56 days
     group_by(country, store, product) %>% 
-    future_frame(.date_var = date, .length_out = 56, .bind_data = TRUE) %>% 
+    future_frame(.date_var = date, .length_out = 365, .bind_data = TRUE) %>% 
     ungroup() %>% 
     
     # lags, rolling features & fourier features
@@ -134,12 +134,12 @@ full_data_tbl <- train_clean_tbl %>%
     map(.f = function(df) {
         df %>% 
             arrange(date) %>% 
-            tk_augment_fourier(date, .periods = c(7, 14, 21, 28)) %>% 
-            tk_augment_lags(num_sold, .lags = 56) %>% 
+            tk_augment_fourier(date, .periods = c(7, 14, 21, 28, 56, 90)) %>% 
+            tk_augment_lags(num_sold, .lags = 365) %>% 
             tk_augment_slidify(
-                num_sold_lag56,
+                num_sold_lag365,
                 .f       = ~ mean(.x, na.rm = TRUE),
-                .period  = c(7, 28, 56),
+                .period  = c(7, 28, 56, 90),
                 .partial = TRUE,
                 .align   = "center"
             )
@@ -162,11 +162,9 @@ future_tbl <- full_data_tbl %>%
 
 future_tbl %>% glimpse()
 
-future_tbl %>% sapply(function(x) sum(is.na(x)))
-
 # * 3.4 Time Split ----
 split_obj <- data_prepared_tbl %>% 
-    time_series_split(date, assess = 56, cumulative = TRUE)
+    time_series_split(date, assess = 90, cumulative = TRUE)
 
 split_obj %>% 
     tk_time_series_cv_plan() %>% 
@@ -245,7 +243,7 @@ wflw_fit_svm <- workflow() %>%
     add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
     fit(train_cleaned)
 
-# * Random Forest ----
+# * 5.5 Random Forest ----
 wflw_fit_rf <- workflow() %>% 
     add_model(
         spec = rand_forest() %>% set_mode("regression") %>% set_engine("ranger")
@@ -253,15 +251,7 @@ wflw_fit_rf <- workflow() %>%
     add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
     fit(train_cleaned)
 
-# * Neural Net ----
-wflw_fit_nnet <- workflow() %>% 
-    add_model(
-        spec = mlp() %>% set_mode("regression") %>% set_engine("nnet")
-    ) %>% 
-    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
-    fit(train_cleaned)
-
-# * MARS ----
+# * 5.6 MARS ----
 wflw_fit_mars <- workflow() %>% 
     add_model(
         spec = mars() %>% set_mode("regression") %>% set_engine("earth")
@@ -269,7 +259,7 @@ wflw_fit_mars <- workflow() %>%
     add_recipe(recipe_spec %>% update_role(date, new_role = "indicator")) %>% 
     fit(train_cleaned)
 
-# * Cubist ----
+# * 5.7 Cubist ----
 wflw_fit_cubist <- workflow() %>% 
     add_model(
         spec = cubist_rules() %>% set_mode("regression") %>% set_engine("Cubist")
@@ -278,18 +268,17 @@ wflw_fit_cubist <- workflow() %>%
     fit(train_cleaned)
 
 # * 5.5 Accuracy Check ----
-sub_models_fit_tbl <- modeltime_table(
+sub_models_tbl <- modeltime_table(
     wflw_fit_prophet,
     wflw_fit_xgboost,
     wflw_fit_prophet_boost,
     wflw_fit_svm,
     wflw_fit_rf,
-    wflw_fit_nnet,
     wflw_fit_mars,
     wflw_fit_cubist
 )
 
-sub_models_fit_tbl %>% 
+sub_models_tbl %>% 
     modeltime_accuracy(testing(split_obj)) %>% 
     arrange(smape)
 
@@ -313,21 +302,22 @@ resamples_kfold %>%
 
 # * 6.3 Model Tuning ----
 
-# ** Cubist Tune ----
-model_spec_cubist_tune <- cubist_rules(
-    mode = "regression",
-    committees = tune(),
-    neighbors  = tune()
+# ** SVM RBF ----
+model_spec_svm_rbf_tune <- svm_rbf(
+    mode      = "regression",
+    cost      = tune(),
+    rbf_sigma = tune(),
+    margin    = tune()
 ) %>% 
-    set_engine("Cubist")
+    set_engine("kernlab")
 
-wflw_spec_cubist_tune <- workflow() %>% 
-    add_model(model_spec_cubist_tune) %>% 
+wflw_spec_svm_rbf_tune <- workflow() %>% 
+    add_model(model_spec_svm_rbf_tune) %>% 
     add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
 
-set.seed(123)
 tic()
-tune_results_cubist <- wflw_spec_cubist_tune %>% 
+set.seed(123)
+tune_results_svm_rbf <- wflw_spec_svm_rbf_tune %>% 
     tune_grid(
         resamples = resamples_kfold,
         grid      = 10,
@@ -335,43 +325,12 @@ tune_results_cubist <- wflw_spec_cubist_tune %>%
     )
 toc()
 
-wflw_fit_cubist_tuned <- wflw_spec_cubist_tune %>% 
-    finalize_workflow(select_best(tune_results_cubist, "rmse")) %>% 
+wflw_fit_svm_rbf_tuned <- wflw_spec_svm_rbf_tune %>% 
+    finalize_workflow(select_best(tune_results_svm_rbf, "rmse")) %>% 
     fit(train_cleaned)
 
-wflw_fit_cubist_tuned %>% write_rds("../Artifacts/cubist_tuned.rds")
+wflw_fit_svm_rbf_tuned %>% write_rds("../Artifacts/svm_rbf_tuned.rds")
 
-
-# ** Ranger Tune ----
-model_spec_ranger_tune <- rand_forest(
-    mode           = "regression",
-    mtry           = tune(),
-    trees          = tune(),
-    min_n          = tune()
-) %>% 
-    set_engine("ranger")
-
-wflw_spec_ranger_tune <- workflow() %>% 
-    add_model(model_spec_ranger_tune) %>% 
-    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
-
-
-
-set.seed(223)
-tic()
-tune_results_ranger <- wflw_spec_ranger_tune %>%
-    tune_grid(
-        resamples  = resamples_kfold,
-        grid       = 10,
-        control    = control_grid(verbose = TRUE, allow_par = TRUE)
-    )
-toc()
-
-wflw_fit_ranger_tuned <- wflw_spec_ranger_tune %>% 
-    finalize_workflow(select_best(tune_results_ranger, "rmse")) %>% 
-    fit(train_cleaned)
-
-wflw_fit_ranger_tuned %>% write_rds("../Artifacts/ranger_tuned.rds")
 
 # ** Xgboost Tune ----
 model_spec_xgboost_tune <- boost_tree(
@@ -408,22 +367,51 @@ wflw_fit_xgboost_tuned <- wflw_spec_xgboost_tune %>%
 
 wflw_fit_xgboost_tuned %>% write_rds("../Artifacts/xgboost_tuned.rds")
 
-# ** SVM RBF ----
-model_spec_svm_rbf_tune <- svm_rbf(
-    mode      = "regression",
-    cost      = tune(),
-    rbf_sigma = tune(),
-    margin    = tune()
+# ** Ranger Tune ----
+model_spec_ranger_tune <- rand_forest(
+    mode           = "regression",
+    mtry           = tune(),
+    trees          = tune(),
+    min_n          = tune()
 ) %>% 
-    set_engine("kernlab")
+    set_engine("ranger")
 
-wflw_spec_svm_rbf_tune <- workflow() %>% 
-    add_model(model_spec_svm_rbf_tune) %>% 
+wflw_spec_ranger_tune <- workflow() %>% 
+    add_model(model_spec_ranger_tune) %>% 
     add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
 
+set.seed(223)
 tic()
+tune_results_ranger <- wflw_spec_ranger_tune %>%
+    tune_grid(
+        resamples  = resamples_kfold,
+        grid       = 10,
+        control    = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+toc()
+
+wflw_fit_ranger_tuned <- wflw_spec_ranger_tune %>% 
+    finalize_workflow(select_best(tune_results_ranger, "rmse")) %>% 
+    fit(train_cleaned)
+
+wflw_fit_ranger_tuned %>% write_rds("../Artifacts/ranger_tuned.rds")
+
+
+# ** Cubist Tune ----
+model_spec_cubist_tune <- cubist_rules(
+    mode = "regression",
+    committees = tune(),
+    neighbors  = tune()
+) %>% 
+    set_engine("Cubist")
+
+wflw_spec_cubist_tune <- workflow() %>% 
+    add_model(model_spec_cubist_tune) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
 set.seed(123)
-tune_results_svm_rbf <- wflw_spec_svm_rbf_tune %>% 
+tic()
+tune_results_cubist <- wflw_spec_cubist_tune %>% 
     tune_grid(
         resamples = resamples_kfold,
         grid      = 10,
@@ -431,35 +419,73 @@ tune_results_svm_rbf <- wflw_spec_svm_rbf_tune %>%
     )
 toc()
 
-wflw_fit_svm_rbf_tuned <- wflw_spec_svm_rbf_tune %>% 
-    finalize_workflow(select_best(tune_results_svm_rbf, "rmse")) %>% 
+wflw_fit_cubist_tuned <- wflw_spec_cubist_tune %>% 
+    finalize_workflow(select_best(tune_results_cubist, "rmse")) %>% 
     fit(train_cleaned)
 
-wflw_fit_svm_rbf_tuned %>% write_rds("../Artifacts/svm_rbf_tuned.rds")
+wflw_fit_cubist_tuned %>% write_rds("../Artifacts/cubist_tuned.rds")
+
+# ** MARS ----
+model_spec_mars_tuned <- mars(
+    mode        = "regression",
+    num_terms   = tune(),
+    prod_degree =  tune()
+) %>% 
+    set_engine("earth")
+
+wflw_spec_mars_tune <- workflow() %>% 
+    add_model(model_spec_mars_tuned) %>% 
+    add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+tic()
+set.seed(123)
+tune_results_mars <- wflw_spec_mars_tune %>% 
+    tune_grid(
+        resamples = resamples_kfold,
+        grid      = 10,
+        control   = control_grid(verbose = TRUE, allow_par = TRUE)
+    )
+toc()
+
+wflw_fit_mars_tuned <- wflw_spec_mars_tune %>% 
+    finalize_workflow(select_best(tune_results_mars, "rmse")) %>% 
+    fit(train_cleaned)
+
+
+wflw_fit_mars_tuned %>% write_rds("../Artifacts/mars_tuned.rds")
+
+
 
 # * 6.4 Model Evaluation ----
 
 # ** Modeltime Table ----
-sub_models_fit_2_tbl <- modeltime_table(
-    wflw_fit_cubist_tuned,
+sub_models_2_tbl <- modeltime_table(
+    wflw_fit_svm_rbf_tuned,
     wflw_fit_ranger_tuned,
     wflw_fit_xgboost_tuned,
-    wflw_fit_svm_rbf_tuned
+    wflw_fit_cubist_tuned,
+    wflw_fit_mars_tuned
+    
 ) %>% 
-    update_model_description(1, "CUBIST - Tuned") %>% 
+    update_model_description(1, "KERNLAB - Tuned") %>% 
     update_model_description(2, "RANGER - Tuned") %>% 
     update_model_description(3, "XGBOOST - Tuned") %>% 
-    update_model_description(4, "KERNLAB - Tuned") %>% 
-    combine_modeltime_tables(sub_models_fit_tbl)
+    update_model_description(4, "CUBIST - Tuned") %>% 
+    update_model_description(5, "EARTH - Tuned") %>% 
+    combine_modeltime_tables(sub_models_tbl)
 
 # ** Calibration Table ----
-calibration_tbl <- sub_models_fit_2_tbl %>% 
+calibration_tbl <- sub_models_2_tbl %>% 
     modeltime_calibrate(testing(split_obj))
 
 # ** Accuracy Check ----
 calibration_tbl %>% 
     modeltime_accuracy() %>% 
     arrange(smape)
+
+# calibration_tbl %>% 
+#     modeltime_accuracy() %>% 
+#     arrange(rmse)
 
 # ** Visualize ----
 forecast_tbl <- calibration_tbl %>% 
@@ -499,7 +525,7 @@ resamples_tscv %>%
     plot_time_series_cv_plan(date, num_sold)
 
 # * 7.2 Fitting Resamples ----
-model_tbl_tuned_resamples <- sub_models_fit_2_tbl %>% 
+model_tbl_tuned_resamples <- sub_models_2_tbl %>% 
     filter(.model_desc != "NNET") %>% 
     modeltime_fit_resamples(
         resamples = resamples_tscv,
@@ -514,7 +540,7 @@ model_tbl_tuned_resamples_accuracy <- model_tbl_tuned_resamples %>%
     ) %>% 
     arrange(smape_mean)
 
-# * 7.3 Visualize Tuned Resamples ----
+# * 7.4 Visualize Tuned Resamples ----
 model_tbl_tuned_resamples %>% 
     plot_modeltime_resamples(
         .metric_set  = metric_set(smape),
@@ -526,34 +552,28 @@ model_tbl_tuned_resamples %>%
 # 8.0 ENSEMBLING ----
 
 # * 8.1 Average Ensemble ----
-sub_models_2_ids_to_keep <- c(3, 2, 1)
+sub_models_2_ids_to_keep <- c(3, 2, 5, 1)
 
-ensemble_fit_1 <- sub_models_fit_2_tbl %>% 
+ensemble_fit_1 <- sub_models_2_tbl %>% 
     filter(.model_id %in% sub_models_2_ids_to_keep) %>% 
     ensemble_average()
 
-ensemble_fit_2 <- sub_models_fit_2_tbl %>% 
+ensemble_fit_2 <- sub_models_2_tbl %>% 
     filter(.model_id %in% sub_models_2_ids_to_keep[1:2]) %>% 
     ensemble_average()
 
-ensemble_fit_3 <- sub_models_fit_2_tbl %>% 
-    filter(.model_id %in% sub_models_2_ids_to_keep[c(1, 3)]) %>% 
-    ensemble_average()
-
-ensemble_fit_4 <- sub_models_fit_2_tbl %>% 
-    filter(.model_id %in% sub_models_2_ids_to_keep[2:3]) %>% 
+ensemble_fit_3 <- sub_models_2_tbl %>% 
+    filter(.model_id %in% sub_models_2_ids_to_keep[c(1, 2, 3)]) %>% 
     ensemble_average()
 
 model_ensemble_tbl <- modeltime_table(
     ensemble_fit_1, 
     ensemble_fit_2,
-    ensemble_fit_3,
-    ensemble_fit_4
+    ensemble_fit_3
 ) %>% 
-    update_model_description(1, 'ENSEMBLE (MEAN) - Xgboost, Ranger, Cubist') %>% 
+    update_model_description(1, 'ENSEMBLE (MEAN) - Kernlab, Ranger, Xgboost, Earth') %>% 
     update_model_description(2, "ENSEMBLE (MEAN) - Ranger, Xgboost") %>% 
-    update_model_description(3, "ENSEMBLE (MEAN) - Cubist, Xgboost") %>% 
-    update_model_description(4, "ENSEMBLE (MEAN) - Ranger, Cubist")
+    update_model_description(3, "ENSEMBLE (MEAN) - Ranger, Xgboost, Earth")
 
 # * 8.2 Ensemble Accuracy ----
 model_ensemble_calibrate_tbl <- model_ensemble_tbl %>% 
@@ -567,37 +587,114 @@ model_ensemble_calibrate_tbl %>%
 
 # Here we refit the best ensemble model on the entire dataset
 
+# * 9.1 Clean Data Prepared ----
 data_prepared_tbl_cleaned <- data_prepared_tbl %>% 
     group_by(country, store, product) %>% 
     mutate(num_sold = ts_clean_vec(num_sold, period = 7)) %>% 
     ungroup()
 
+# * 9.2 Refit Top Ensemble Model to Data Prepared ----
 model_ensemble_refit_tbl <- model_ensemble_tbl %>% 
     filter(.model_id == 1) %>% 
-    modeltime_refit(
-        data = data_prepared_tbl_cleaned
-    )
+    modeltime_refit(data = data_prepared_tbl_cleaned)
 
 
-model_ensemble_refit_tbl %>% 
+future_forecast_tbl <-  model_ensemble_refit_tbl %>% 
     modeltime_forecast(
-        test_clean_tbl %>% mutate(num_sold = NA)
+        new_data    = future_tbl,
+        actual_data = data_prepared_tbl,
+        keep_data   = TRUE
+    ) %>% 
+    mutate(
+        .value = exp(.value),
+        num_sold = exp(num_sold)
+    )
+
+# * Visualize ----
+future_forecast_tbl %>% 
+    filter(country == "Sweden") %>% 
+    filter(date >= as.Date("2017-01-01")) %>% 
+    group_by(store, product) %>% 
+    plot_modeltime_forecast(
+        .facet_ncol         = 2,
+        .y_intercept        = 0,
+        .conf_interval_show = FALSE
+    )
+
+# 9.3 Refit Xgboost Tuned Model to Data Prepared ----
+xgboost_tuned_refit_tbl <- sub_models_2_tbl %>% 
+    filter(.model_id == 3) %>% 
+    modeltime_refit(data = data_prepared_tbl_cleaned)
+
+xgboost_future_forecast_tbl <- xgboost_tuned_refit_tbl %>% 
+    modeltime_forecast(
+        new_data    = future_tbl,
+        actual_data = data_prepared_tbl,
+        keep_data   = TRUE 
+    ) %>% 
+    mutate(
+        .value = exp(.value),
+        num_sold = exp(num_sold)
     )
 
 
-# SAVING ARTIFACTS ----
-feature_engineering_artifacts_list_2 <- list(
+# 10 KAGGLE SUBMISSION ----
+test_ids <- test_clean_tbl %>% 
+    mutate(concat_id = paste(date, country, store, product, sep = "-")) %>% 
+    select(row_id, concat_id)
+
+# * 10.1 Ensemble Submission ----
+future_tbl_ids <- future_forecast_tbl %>% 
+    filter(.key == "prediction") %>%
+    select(date, country, store, product, .value) %>% 
+    mutate(concat_id = paste(date, country, store, product, sep = "-"))
+
+submission_tbl <- future_tbl_ids %>% 
+    left_join(test_ids) %>% 
+    select(row_id, .value) %>% 
+    rename(num_sold = .value)
+
+submission_tbl %>% write.csv("../Artifacts/submission_file.csv", row.names = FALSE)
+
+# * 10.2 Xgboost Submission
+xgboost_tbl_ids <- xgboost_future_forecast_tbl %>% 
+    filter(.key == "prediction") %>%
+    select(date, country, store, product, .value) %>% 
+    mutate(concat_id = paste(date, country, store, product, sep = "-"))
+
+xgboost_submission_tbl <- xgboost_tbl_ids %>% 
+    left_join(test_ids) %>% 
+    select(row_id, .value) %>% 
+    rename(num_sold = .value)
+
+xgboost_submission_tbl %>% write.csv("../Artifacts/xgboost_submission_file.csv", row.names = FALSE)
+
+
+# 11.0 SAVING ARTIFACTS ----
+feature_engineering_artifacts_list <- list(
+    
+    # Data
+    data = list(
+        data_prepared_tbl = data_prepared_tbl,
+        forecast_tbl      = future_tbl,
+        submittion_tbl    = submittion_tbl
+    ),
     
     # Recipe
     recipes = list(recipe = recipe_spec),
     
     # Models Tuned
     models = list(
-        sub_models_tuned = sub_models_fit_2_tbl,
+        sub_models_tuned = sub_models_2_tbl,
         ensemble_models  = model_ensemble_tbl
     )
     
 )
 
-feature_engineering_artifacts_list_2 %>% 
+feature_engineering_artifacts_list %>% 
     write_rds("../Artifacts/feat_engineering_artifacts_list_1.rds")
+
+
+
+tune_results_xgboost %>% autoplot()
+
